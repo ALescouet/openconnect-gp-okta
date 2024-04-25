@@ -14,6 +14,7 @@ import signal
 import ssl
 import subprocess
 import sys
+import tempfile
 import urllib
 
 try:
@@ -29,6 +30,17 @@ try:
 except ImportError:
     HAS_FIDO2 = False
     UserInteraction = object
+
+try:
+    from cryptography.hazmat.primitives.serialization import (
+        pkcs12,
+        Encoding,
+        PrivateFormat,
+        NoEncryption,
+    )
+    HAS_PKCS12 = True
+except ImportError:
+    HAS_PKCS12 = False
 
 
 class ConsoleInteraction(UserInteraction):
@@ -255,6 +267,14 @@ class TLSAdapter(requests.adapters.HTTPAdapter):
             kwargs['ssl_context'] = ctx
             return super(TLSAdapter, self).init_poolmanager(*args, **kwargs)
 
+
+def do_okta_saml(s, gateway, username, password, factor_priorities, totp_key):
+    s.mount('https://', TLSAdapter())
+    saml_req_url = prelogin(s, gateway)
+    saml_resp_url, saml_resp_data = okta_saml(s, saml_req_url, username, password, factor_priorities, totp_key)
+    return complete_saml(s, saml_resp_url, saml_resp_data)
+
+
 @click.command()
 @click.argument('gateway', required=False)
 @click.argument('openconnect-args', nargs=-1)
@@ -262,6 +282,9 @@ class TLSAdapter(requests.adapters.HTTPAdapter):
 @click.option('--username')
 @click.option('--password')
 @click.option('--password-cmd')
+@click.option('--cert-path')
+@click.option('--cert-password')
+@click.option('--cert-password-cmd')
 @click.option('--factor-priority', 'factor_priorities', nargs=2, type=click.Tuple((str, int)), multiple=True)
 @click.option('--totp-key')
 @click.option('--totp-key-cmd')
@@ -273,6 +296,9 @@ def main(
     username,
     password,
     password_cmd,
+    cert_path,
+    cert_password,
+    cert_password_cmd,
     factor_priorities,
     totp_key,
     totp_key_cmd,
@@ -289,6 +315,9 @@ def main(
     username = conf.get('common', 'username', vars=args, fallback=username)
     password = conf.get('common', 'password', vars=args, fallback=password)
     password_cmd = conf.get('common', 'password-cmd', vars=args, fallback=password_cmd)
+    cert_path = conf.get('common', 'cert-path', vars=args, fallback=cert_path)
+    cert_password = conf.get('common', 'cert-password', vars=args, fallback=cert_password)
+    cert_password_cmd = conf.get('common', 'cert-password-cmd', vars=args, fallback=cert_password_cmd)
     totp_key = conf.get('common', 'totp-key', vars=args, fallback=totp_key)
     totp_key_cmd = conf.get('common', 'totp-key-cmd', vars=args, fallback=totp_key)
     sudo = conf.get('common', 'sudo', vars=args, fallback=False if sudo is None else sudo)
@@ -307,6 +336,10 @@ def main(
         click.echo('--totp-key requires pyotp!', err=True)
         sys.exit(1)
 
+    if cert_path is not None and not HAS_PKCS12:
+        click.echo('--cert-path requires cryptography!', err=True)
+        sys.exit(1)
+
     if gateway is None:
         click.echo('No gateway provided', err=True)
         sys.exit(1)
@@ -318,16 +351,53 @@ def main(
     if password is None:
         password = click.prompt('Password', hide_input=True)
 
+    cert_crt = cert_key = None
+    cert_args = []
+    if cert_path is not None and cert_path.endswith('.p12'):
+        if cert_password_cmd is not None:
+            cert_password = run_cmd(cert_password_cmd, "Cert password")
+        if cert_password is None:
+            cert_password = click.prompt('Cert Password', hide_input=True)
+
+        cert_args = ['-c', cert_path, '-p', cert_password]
+
+        with open(cert_path, 'rb') as fp:
+            cert_key, cert_crt, _ = pkcs12.load_key_and_certificates(
+                fp.read(),
+                cert_password.encode('utf-8'))
+
     factor_priorities = {
         'token:software:totp': 0 if totp_key is None else 2,
         'push': 1,
         **dict(factor_priorities)}
 
     with requests.Session() as s:
-        s.mount('https://', TLSAdapter())
-        saml_req_url = prelogin(s, gateway)
-        saml_resp_url, saml_resp_data = okta_saml(s, saml_req_url, username, password, factor_priorities, totp_key)
-        saml_username, prelogin_cookie = complete_saml(s, saml_resp_url, saml_resp_data)
+        if cert_crt is not None and cert_key is not None:
+            crt = cert_crt.public_bytes(encoding=Encoding.PEM)
+            key = cert_key.private_bytes(encoding=Encoding.PEM,
+                                         format=PrivateFormat.PKCS8,
+                                         encryption_algorithm=NoEncryption())
+
+            # This is a kludge because there's no interface to take an
+            # in-memory certificate and key.
+            with tempfile.TemporaryDirectory() as tdir:
+                with tempfile.NamedTemporaryFile(dir=tdir, prefix='crt-', buffering=0) as crt_file, \
+                     tempfile.NamedTemporaryFile(dir=tdir, prefix='key-', buffering=0) as key_file:
+                    crt_file.write(crt)
+                    key_file.write(key)
+                    s.cert = (crt_file.name, key_file.name)
+                    saml_username, prelogin_cookie = do_okta_saml(
+                        s,
+                        gateway,
+                        username,
+                        password,
+                        factor_priorities,
+                        totp_key,
+                    )
+        else:
+            saml_username, prelogin_cookie = do_okta_saml(
+                s, gateway, username, password, factor_priorities, totp_key
+            )
 
     subprocess_args = [
         'openconnect',
@@ -336,7 +406,7 @@ def main(
         '--user=' + saml_username,
         '--usergroup=gateway:prelogin-cookie',
         '--passwd-on-stdin'
-    ] + list(openconnect_args)
+    ] + cert_args + list(openconnect_args)
 
     if sudo:
         subprocess_args = ['sudo'] + subprocess_args
