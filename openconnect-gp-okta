@@ -289,6 +289,7 @@ def do_okta_saml(s, gateway, username, password, factor_priorities, totp_key):
 @click.option('--totp-key')
 @click.option('--totp-key-cmd')
 @click.option('--sudo/--no-sudo', default=None)
+@click.option('--useragent', default='PAN GlobalProtect')
 def main(
     gateway,
     openconnect_args,
@@ -303,6 +304,7 @@ def main(
     totp_key,
     totp_key_cmd,
     sudo,
+    useragent,
 ):
     args = { k: v for k, v in locals().items() if v is not None }
 
@@ -319,8 +321,9 @@ def main(
     cert_password = conf.get('common', 'cert-password', vars=args, fallback=cert_password)
     cert_password_cmd = conf.get('common', 'cert-password-cmd', vars=args, fallback=cert_password_cmd)
     totp_key = conf.get('common', 'totp-key', vars=args, fallback=totp_key)
-    totp_key_cmd = conf.get('common', 'totp-key-cmd', vars=args, fallback=totp_key)
+    totp_key_cmd = conf.get('common', 'totp-key-cmd', vars=args, fallback=totp_key_cmd)
     sudo = conf.get('common', 'sudo', vars=args, fallback=False if sudo is None else sudo)
+    useragent = conf.get('common', 'useragent', vars=args, fallback=useragent)
 
     if conf.has_section('factor-priority'):
         factor_priorities += tuple(
@@ -372,6 +375,7 @@ def main(
         **dict(factor_priorities)}
 
     with requests.Session() as s:
+        s.headers={'User-Agent': useragent}
         if cert_crt is not None and cert_key is not None:
             crt = cert_crt.public_bytes(encoding=Encoding.PEM)
             key = cert_key.private_bytes(encoding=Encoding.PEM,
@@ -405,7 +409,8 @@ def main(
         '--protocol=gp',
         '--user=' + saml_username,
         '--usergroup=gateway:prelogin-cookie',
-        '--passwd-on-stdin'
+        '--passwd-on-stdin',
+        '--useragent=' + useragent
     ] + cert_args + list(openconnect_args)
 
     if sudo:
@@ -415,4 +420,5 @@ def main(
         p.stdin.write(prelogin_cookie.encode())
     sys.exit(p.returncode)
 
-main()
+if __name__ == '__main__':
+    main(auto_envvar_prefix='GP')
